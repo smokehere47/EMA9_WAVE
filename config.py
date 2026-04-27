@@ -92,3 +92,26 @@ ASYNC_MAX_CONCURRENT = 10
 # ── FastAPI server ────────────────────────────────────────────────────────────
 API_HOST = "0.0.0.0"
 API_PORT = 8000
+
+
+# ── MongoDB ────────────────────────────────────────────────────
+MONGO_URI = "mongodb://localhost:27017"   # change if running remote Mongo
+MONGO_DB  = "EMA9_WAVE"
+ 
+# ── Historical preload ─────────────────────────────────────────
+# Calendar days of history to fetch (30 trading days ≈ 45 calendar days)
+HISTORICAL_PRELOAD_DAYS = 45
+ 
+# All timeframes to store. Add/remove as needed.
+# Valid Fyers resolutions: "1","2","3","5","10","15","20","30","60","120","240"
+HISTORICAL_TIMEFRAMES = ["1", "3", "5", "10", "15", "30", "60"]
+ 
+# ── Strategy signal engine ─────────────────────────────────────
+# How many historical candles to pull from MongoDB as EMA warm-up
+# before appending live candles. 50 is enough for EMA-9 stability.
+HISTORY_LOOKBACK = 50
+ 
+# ── Chart engine ───────────────────────────────────────────────
+CHART_HOST = "0.0.0.0"
+CHART_PORT = 8001        # separate from main.py's API_PORT (8000)
+ 
