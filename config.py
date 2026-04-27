@@ -23,7 +23,7 @@ SYMBOL_COLUMN  = "symbol"
 # ── Development mode ──────────────────────────────────────────────────────────
 # DEV_MODE = True  → scan only DEV_SYMBOLS (fast testing, ~5-6 stocks)
 # DEV_MODE = False → scan all stocks from INPUT_EXCEL (production)
-DEV_MODE = True
+DEV_MODE = False
 DEV_SYMBOLS = [
     "NSE:ZYDUSLIFE-EQ",
     "NSE:YESBANK-EQ",
@@ -43,10 +43,10 @@ IST = pytz.timezone("Asia/Kolkata")
 # ── Candle timeframe ──────────────────────────────────────────────────────────
 # Controls ALL data fetching, EMA calculation, and strategy logic.
 # Valid values: "1", "3", "5"
-TIMEFRAME = "3"   # ← Change to "1" or "5" as needed
+TIMEFRAME = "5"   # ← Change to "1" or "5" as needed
 
 # ── How many calendar days of OHLC history to fetch per symbol ────────────────
-FETCH_DAYS = 5
+FETCH_DAYS = 10
 
 # ── EMA period ────────────────────────────────────────────────────────────────
 EMA_PERIOD = 9
@@ -78,7 +78,7 @@ ENTRY_MAX_CANDLES = 3
 # Date range backtest:
 #   OVERRIDE_TRADING_DAY = None
 #   OVERRIDE_DATE_RANGE  = ("2026-03-20", "2026-03-25")
-OVERRIDE_TRADING_DAY = None   # e.g. "2026-04-15"
+OVERRIDE_TRADING_DAY = "2026-04-23"   # e.g. "2026-04-15"
 OVERRIDE_DATE_RANGE  = None   # e.g. ("2026-03-20", "2026-03-25")
 
 # ── Output flags ──────────────────────────────────────────────────────────────
