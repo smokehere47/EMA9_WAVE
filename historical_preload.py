@@ -1,22 +1,32 @@
 # ================= HISTORICAL PRELOAD — EMA 9 WAVE =================
 #
-# Fetches up to 30 calendar days of OHLCV data from Fyers REST API
-# for every symbol × every configured timeframe.
+# Fetches OHLCV history from Fyers REST API for every symbol × TF.
+# Uses the proven batch pattern: BATCH_SIZE symbols in parallel,
+# BATCH_PAUSE seconds between batches — same logic as the original scanner.
 #
-# Storage schema (MongoDB):
-#   DB  : ema9_wave
-#   COL : candles_{tf}   (one collection per timeframe, e.g. candles_3)
-#   DOC : {
-#           symbol   : "NSE:RELIANCE-EQ",
-#           datetime : ISODate(...),          ← UTC stored, IST on read
-#           open, high, low, close, volume : float/int
-#         }
-#   INDEX: unique compound on (symbol, datetime) per collection
+# MongoDB layout:
+#   DB  : EMA_wave
+#   Collection per TF:  candle_{tf}
+#   e.g. candle_1, candle_5, candle_15, candle_60
+#   Each collection holds ALL symbols for that timeframe.
+#   DOC : { symbol, datetime (IST naive), open, high, low, close, volume }
+#   IDX : unique compound on (symbol, datetime) per collection
+#
+# Structure mirrors:
+#   EMA_wave
+#   ├── candle_1
+#   │   ├── { symbol: "NSE:HINDPETRO-EQ", datetime: ..., open: ..., ... }
+#   │   ├── { symbol: "NSE:ALKEM-EQ",     datetime: ..., ... }
+#   │   └── ...
+#   ├── candle_15
+#   │   └── ...
+#   └── ...
 #
 # Usage:
-#   python historical_preload.py                   # all symbols, all TFs
+#   python historical_preload.py
 #   python historical_preload.py --symbol NSE:RELIANCE-EQ
-#   python historical_preload.py --tf 5            # only one TF
+#   python historical_preload.py --tf 5
+#   python historical_preload.py --days 30
 # ====================================================================
 
 from __future__ import annotations
@@ -24,33 +34,96 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-import asyncio
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
-import pandas as pd
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient, ASCENDING, UpdateOne
 from pymongo.errors import BulkWriteError
 
 from config import (
     IST,
-    FETCH_DAYS,                  # default 5; we override with 30 here
-    ASYNC_MAX_CONCURRENT,
-    HISTORICAL_PRELOAD_DAYS,     # NEW: 30  (add to config.py)
-    HISTORICAL_TIMEFRAMES,       # NEW: ["1","3","5","10","15","30","60"]
-    MONGO_URI,                   # NEW: "mongodb://localhost:27017"
-    MONGO_DB,                    # NEW: "ema9_wave"
+    HISTORICAL_PRELOAD_DAYS,
+    HISTORICAL_TIMEFRAMES,
+    MONGO_CREDS_FILE,
+    MONGO_DB_DEFAULT,
+    MONGO_COLLECTION_PREFIX,
+    PRELOAD_BATCH_SIZE,
+    PRELOAD_BATCH_PAUSE,
 )
 from fyers_client import get_fyers, check_token_mid_run
 from symbol_loader import load_symbols
 
-# ── MongoDB helpers ───────────────────────────────────────────────────────────
 
-def _get_collection(tf: str):
-    client = MongoClient(MONGO_URI)
-    db = client[MONGO_DB]
-    col = db[f"candles_{tf}"]
+# ─────────────────────────────────────────────────────────────────────────────
+# MongoDB credentials loaded from file (no creds in source code)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_mongo_creds(creds_file: str) -> tuple[str, str]:
+    import os
+    creds_path = os.path.abspath(creds_file)
+    if not os.path.isfile(creds_path):
+        raise FileNotFoundError(
+            f"MongoDB credentials file not found: {creds_path}\n"
+            "Create the file with:\n  uri=mongodb://<host>:<port>\n  db=<database_name>"
+        )
+    parsed: dict[str, str] = {}
+    with open(creds_path, "r", encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            parsed[key.strip().lower()] = value.strip()
+    uri = parsed.get("uri", "")
+    if not uri:
+        raise ValueError(f"'uri' key missing in credentials file: {creds_path}")
+    db_name = parsed.get("db", MONGO_DB_DEFAULT)
+    return uri, db_name
+
+
+try:
+    _MONGO_URI, _MONGO_DB = _load_mongo_creds(MONGO_CREDS_FILE)
+except (FileNotFoundError, ValueError) as _e:
+    print(f"\n  ❌ {_e}\n")
+    sys.exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Collection naming
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _col_name(tf: str) -> str:
+    """
+    Collection name pattern: candle_{tf}
+    Examples: candle_1, candle_5, candle_15, candle_60
+    All symbols for a given TF are stored in the same collection.
+    """
+    return f"{MONGO_COLLECTION_PREFIX}_{tf}"
+
+
+# ── Shared MongoDB client (thread-safe, connection-pooled) ────────────────────
+_mongo_client: MongoClient | None = None
+_mongo_lock   = threading.Lock()
+
+
+def _get_client() -> MongoClient:
+    global _mongo_client
+    with _mongo_lock:
+        if _mongo_client is None:
+            _mongo_client = MongoClient(_MONGO_URI, maxPoolSize=PRELOAD_BATCH_SIZE + 2)
+    return _mongo_client
+
+
+def _get_col(tf: str):
+    """
+    Return (and auto-create compound index on) the per-TF collection.
+    Collection name: candle_{tf}
+    Index: unique compound on (symbol, datetime).
+    """
+    col = _get_client()[_MONGO_DB][_col_name(tf)]
     col.create_index(
         [("symbol", ASCENDING), ("datetime", ASCENDING)],
         unique=True,
@@ -59,14 +132,9 @@ def _get_collection(tf: str):
     return col
 
 
-def _upsert_candles(col, symbol: str, records: list[dict]) -> int:
-    """
-    Bulk-upsert candle records.  Skips duplicates silently.
-    Returns the number of newly inserted docs.
-    """
+def _upsert(col, records: list[dict]) -> int:
     if not records:
         return 0
-    from pymongo import UpdateOne
     ops = [
         UpdateOne(
             {"symbol": r["symbol"], "datetime": r["datetime"]},
@@ -76,29 +144,21 @@ def _upsert_candles(col, symbol: str, records: list[dict]) -> int:
         for r in records
     ]
     try:
-        result = col.bulk_write(ops, ordered=False)
-        return result.upserted_count
+        return col.bulk_write(ops, ordered=False).upserted_count
     except BulkWriteError as bwe:
-        # Duplicate key errors are expected and harmless
         return bwe.details.get("nUpserted", 0)
 
 
-# ── Fetch one (symbol, tf) block ─────────────────────────────────────────────
+# ── Fyers fetch for one (symbol, tf) ─────────────────────────────────────────
 
-def _fetch_one(
-    fyers,
-    symbol: str,
-    tf: str,
-    days: int,
-) -> list[dict] | None:
+def _fetch(fyers, symbol: str, tf: str, days: int) -> list[dict] | None:
     """
-    Calls Fyers history API and returns a list of candle dicts.
-    Returns None on unrecoverable error; empty list if no data.
+    Returns list[dict] on success, None on token expiry, [] on skip.
+    Each document includes 'symbol' field since all symbols share one collection.
     """
-    now_ist = datetime.now(IST)
-    range_to   = now_ist.strftime("%Y-%m-%d")
-    range_from = (now_ist - timedelta(days=days + 5)).strftime("%Y-%m-%d")
-    # +5 to guarantee we always capture full 30 trading days despite weekends
+    now        = datetime.now(IST)
+    range_to   = now.strftime("%Y-%m-%d")
+    range_from = (now - timedelta(days=days + 5)).strftime("%Y-%m-%d")
 
     try:
         resp = fyers.history({
@@ -110,145 +170,116 @@ def _fetch_one(
             "cont_flag":   "1",
         })
     except Exception as exc:
-        print(f"  [{symbol}|{tf}m] Request error: {exc}")
-        return None
+        print(f"\n  [{symbol}|{tf}m] error: {exc}")
+        return []
 
-    if resp.get("s") != "ok":
+    s    = resp.get("s", "")
+    code = str(resp.get("code", ""))
+
+    if s != "ok":
         if check_token_mid_run(resp):
-            return None  # caller handles token refresh
-        code = str(resp.get("code", ""))
-        if code in ("-300", "300"):
-            return []   # symbol has no data for this TF
-        print(f"  [{symbol}|{tf}m] API error {code}: {resp.get('message','')}")
+            return None
+        if code not in ("-300", "300"):
+            print(f"\n  [{symbol}|{tf}m] API {code}: {resp.get('message','')}")
         return []
 
     candles = resp.get("candles", [])
     if not candles:
         return []
 
-    # Convert to UTC-aware datetimes for MongoDB
+    cutoff = datetime.now(IST).replace(tzinfo=None) - timedelta(days=days + 1)
     records: list[dict] = []
-    for c in candles:
-        ts, o, h, l, cl, v = c
-        dt_ist = datetime.fromtimestamp(ts, tz=IST)
-        dt_utc = dt_ist.astimezone(tz=None).replace(tzinfo=None)  # naive UTC for Mongo
+    for ts, o, h, l, cl, v in candles:
+        dt_ist = datetime.fromtimestamp(ts, tz=IST).replace(tzinfo=None)
+        if dt_ist < cutoff:
+            continue
         records.append({
-            "symbol":   symbol,
-            "datetime": dt_utc,
+            "symbol":   symbol,          # stored in document — collection is shared
+            "datetime": dt_ist,          # IST naive — strategy reads with tz_localize(IST)
             "open":     float(o),
             "high":     float(h),
             "low":      float(l),
             "close":    float(cl),
             "volume":   int(v),
         })
-
-    # Keep only the last `days` calendar days of data
-    cutoff = datetime.utcnow() - timedelta(days=days + 1)
-    records = [r for r in records if r["datetime"] >= cutoff]
     return records
 
 
-# ── Worker (runs in thread pool) ─────────────────────────────────────────────
+# ── Worker: fetch + upsert (runs inside thread pool) ─────────────────────────
 
-def _worker(
-    fyers,
-    symbol: str,
-    tf: str,
-    days: int,
-    results: dict,        # {tf: {symbol: count}}
-    lock: threading.Lock,
-    token_flag: list,     # [False]
-) -> None:
-    records = _fetch_one(fyers, symbol, tf, days)
-
+def _fetch_and_store(fyers, symbol: str, tf: str, days: int) -> tuple[str, int | None]:
+    """Returns (symbol, inserted_count) or (symbol, None) on token expiry."""
+    col     = _get_col(tf)
+    records = _fetch(fyers, symbol, tf, days)
     if records is None:
-        # Likely token expiry
-        token_flag[0] = True
-        return
-
-    col = _get_collection(tf)
-    inserted = _upsert_candles(col, symbol, records)
-
-    with lock:
-        results.setdefault(tf, {})[symbol] = inserted
+        return symbol, None
+    return symbol, _upsert(col, records)
 
 
-# ── Async orchestrator ───────────────────────────────────────────────────────
+# ── Core preload: batch pattern identical to original scanner ─────────────────
 
-async def _run_preload(
-    fyers,
-    symbols: list[str],
-    timeframes: list[str],
-    days: int,
-) -> bool:
+def _do_preload(fyers, symbols: list[str], timeframes: list[str], days: int) -> bool:
     """
-    Schedules all (symbol × tf) fetch tasks concurrently.
-    Returns True if a token expiry was detected.
+    For each TF: split symbols into batches of PRELOAD_BATCH_SIZE,
+    fetch each batch in parallel, pause PRELOAD_BATCH_PAUSE between batches.
+
+    All symbols for a given TF are written to one collection: candle_{tf}
+    Documents include a 'symbol' field; index is compound (symbol, datetime).
+
+    Returns True if token expired.
     """
-    tasks: list[tuple[str, str]] = [
-        (sym, tf) for sym in symbols for tf in timeframes
-    ]
-    total = len(tasks)
-    done_ctr = [0]
+    total   = len(symbols) * len(timeframes)
+    done    = 0
+    summary: dict[str, int] = {tf: 0 for tf in timeframes}
 
-    results: dict   = {}
-    lock            = threading.Lock()
-    token_flag      = [False]
-    sem             = asyncio.Semaphore(ASYNC_MAX_CONCURRENT)
-    loop            = asyncio.get_running_loop()
-    executor        = ThreadPoolExecutor(max_workers=ASYNC_MAX_CONCURRENT)
+    for tf in timeframes:
+        num_batches = (len(symbols) + PRELOAD_BATCH_SIZE - 1) // PRELOAD_BATCH_SIZE
+        print(f"\n  ── TF {tf}m ── ({len(symbols)} symbols, {num_batches} batches)")
+        print(f"     Collection: {_col_name(tf)}  (all symbols in one collection)")
 
-    async def _one(symbol: str, tf: str):
-        async with sem:
-            await loop.run_in_executor(
-                executor,
-                _worker,
-                fyers, symbol, tf, days, results, lock, token_flag,
-            )
-            with lock:
-                done_ctr[0] += 1
-            pct = done_ctr[0] * 100 // total
-            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-            sys.stdout.write(f"\r  [{bar}] {done_ctr[0]}/{total} ({pct}%)")
-            sys.stdout.flush()
+        for batch_num, start in enumerate(range(0, len(symbols), PRELOAD_BATCH_SIZE), 1):
+            batch = symbols[start : start + PRELOAD_BATCH_SIZE]
 
-    await asyncio.gather(*[_one(s, tf) for s, tf in tasks])
+            with ThreadPoolExecutor(max_workers=PRELOAD_BATCH_SIZE) as ex:
+                futures = {
+                    ex.submit(_fetch_and_store, fyers, sym, tf, days): sym
+                    for sym in batch
+                }
+                for fut in as_completed(futures):
+                    sym, inserted = fut.result()
+                    if inserted is None:          # token expired
+                        return True
+                    summary[tf]  += inserted
+                    done         += 1
+                    pct = done * 100 // total
+                    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+                    sys.stdout.write(
+                        f"\r  [{bar}] {done}/{total} ({pct}%)  "
+                        f"batch {batch_num}/{num_batches}  {sym[:24]:<24}"
+                    )
+                    sys.stdout.flush()
+
+            # Pause between batches (not after the last batch of a TF)
+            if batch_num < num_batches:
+                time.sleep(PRELOAD_BATCH_PAUSE)
+
     sys.stdout.write("\n")
-    executor.shutdown(wait=False)
-
-    # Summary
     print(f"\n  Preload summary:")
     for tf in timeframes:
-        tf_res = results.get(tf, {})
-        newly = sum(tf_res.values())
-        print(f"    TF {tf:>3}m  — {len(tf_res)} symbols  |  {newly:>6} new candles stored")
-
-    return token_flag[0]
+        print(f"    TF {tf:>3}m — {summary[tf]:>6} new candles stored  →  collection: {_col_name(tf)}")
+    return False
 
 
-# ── Public entry point ───────────────────────────────────────────────────────
+# ── Public entry point ────────────────────────────────────────────────────────
 
 def run_historical_preload(
-    symbols: list[str] | None = None,
+    symbols:    list[str] | None = None,
     timeframes: list[str] | None = None,
-    days: int | None = None,
+    days:       int | None = None,
 ) -> None:
-    """
-    Main callable.  Downloads and stores historical candles for every
-    (symbol, tf) pair.  Refreshes token automatically if expired.
-
-    Parameters
-    ----------
-    symbols    : list of Fyers symbol strings; None → load from config
-    timeframes : list of resolution strings; None → HISTORICAL_TIMEFRAMES
-    days       : calendar days to fetch; None → HISTORICAL_PRELOAD_DAYS
-    """
-    if symbols is None:
-        symbols = load_symbols()
-    if timeframes is None:
-        timeframes = HISTORICAL_TIMEFRAMES
-    if days is None:
-        days = HISTORICAL_PRELOAD_DAYS
+    if symbols    is None: symbols    = load_symbols()
+    if timeframes is None: timeframes = HISTORICAL_TIMEFRAMES
+    if days       is None: days       = HISTORICAL_PRELOAD_DAYS
 
     fyers = get_fyers()
 
@@ -256,43 +287,33 @@ def run_historical_preload(
     print(f"  Symbols     : {len(symbols)}")
     print(f"  Timeframes  : {timeframes}")
     print(f"  Days        : {days}")
-    print(f"  Mongo       : {MONGO_URI}/{MONGO_DB}")
+    print(f"  Batch size  : {PRELOAD_BATCH_SIZE}  |  Batch pause: {PRELOAD_BATCH_PAUSE}s")
+    print(f"  Mongo DB    : {_MONGO_DB}")
+    print(f"  Layout      : candle_{{tf}}  (one collection per TF, all symbols inside)")
     print(f"  Total tasks : {len(symbols) * len(timeframes)}")
     print()
 
-    token_expired = asyncio.run(_run_preload(fyers, symbols, timeframes, days))
+    expired = _do_preload(fyers, symbols, timeframes, days)
 
-    if token_expired:
-        print("  Token expired mid-run — refreshing and retrying once…")
+    if expired:
+        print("  Token expired — refreshing and retrying…")
         fyers = get_fyers()
-        asyncio.run(_run_preload(fyers, symbols, timeframes, days))
+        _do_preload(fyers, symbols, timeframes, days)
 
     print("\n  ✅ Historical preload complete.\n")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def _cli():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EMA9 Wave — Historical Preloader")
-    parser.add_argument(
-        "--symbol", type=str, default=None,
-        help="Single Fyers symbol to fetch (e.g. NSE:RELIANCE-EQ)"
-    )
-    parser.add_argument(
-        "--tf", type=str, default=None,
-        help="Single timeframe to fetch (e.g. 5)"
-    )
-    parser.add_argument(
-        "--days", type=int, default=None,
-        help="Number of calendar days to fetch (default: HISTORICAL_PRELOAD_DAYS)"
-    )
+    parser.add_argument("--symbol", type=str, default=None)
+    parser.add_argument("--tf",     type=str, default=None)
+    parser.add_argument("--days",   type=int, default=None)
     args = parser.parse_args()
 
-    syms = [args.symbol] if args.symbol else None
-    tfs  = [args.tf]     if args.tf     else None
-
-    run_historical_preload(symbols=syms, timeframes=tfs, days=args.days)
-
-
-if __name__ == "__main__":
-    _cli()
+    run_historical_preload(
+        symbols    = [args.symbol] if args.symbol else None,
+        timeframes = [args.tf]     if args.tf     else None,
+        days       = args.days,
+    )
