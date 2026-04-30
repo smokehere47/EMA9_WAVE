@@ -117,9 +117,18 @@ MONGO_DB_DEFAULT  = "EMA9_WAVE"
 # Index: unique on (symbol, datetime) per collection.
 MONGO_COLLECTION_PREFIX = "candle"   # results in candle_1, candle_15, etc.
 
-# ── Historical preload ─────────────────────────────────────────
-# Calendar days of history to fetch (30 trading days ≈ 45 calendar days)
-HISTORICAL_PRELOAD_DAYS = 35
+# ── Historical preload ─────────────────────────────────────────────────────────
+#
+# HISTORICAL_PRELOAD_DAYS is in TRADING DAYS (not calendar days).
+# The preloader converts this to the correct calendar date range by walking
+# backwards through the NSE trading calendar.
+#
+# Rolling window behaviour:
+#   • On each run, only MISSING days are fetched (incremental).
+#   • Any candles older than HISTORICAL_PRELOAD_DAYS trading days are DELETED
+#     so the stored window never grows beyond this limit.
+#
+HISTORICAL_PRELOAD_DAYS = 45   # trading days to keep in MongoDB
  
 # All timeframes to store. Add/remove as needed.
 # Valid Fyers resolutions: "1","2","3","5","10","15","20","30","60","120","240"

@@ -3,7 +3,7 @@
 # Architecture (live mode):
 #   • historical_preload.py  → Fyers REST → MongoDB  (run once at startup)
 #   • Fyers WebSocket        → live candle ticks → LiveCandleStore (strategy.py)
-#   • Scanner loop           → MongoDB (last 1850 candles) + WebSocket buffer
+#   • Scanner loop           → MongoDB (last HISTORY_LOOKBACK candles) + WebSocket buffer
 #                              → scan_symbol() → signals
 #   • ZERO Fyers REST API calls during scan cycle
 #
@@ -14,7 +14,7 @@
 #   Collections: candle_{tf}  (one per timeframe, all symbols inside)
 #   e.g. candle_1, candle_15, candle_60
 #   Each document: { symbol, datetime (IST naive), open, high, low, close, volume }
-#   Index: unique compound on (symbol, datetime) per collection.
+#   Index: unique compound on (symbol ASC, datetime ASC) per collection.
 #
 # FastAPI routes:
 #   GET  /         → health
@@ -160,22 +160,29 @@ def collection_name(tf: str) -> str:
     Return the MongoDB collection name for a given timeframe.
     Pattern:  candle_{tf}
     Example:  candle_15   (holds ALL symbols for the 15-min TF)
+    Compound index on (symbol, datetime) is created by historical_preload.py.
     """
     return f"{MONGO_COLLECTION_PREFIX}_{tf}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Patch strategy.load_history to use new candle_{tf} collections
+# Patch strategy.load_history to use candle_{tf} collections + compound index
 # ─────────────────────────────────────────────────────────────────────────────
 
-from pymongo import MongoClient
+from pymongo import MongoClient, ASCENDING
 import pandas as pd
 
 
 def _load_history_ist(symbol: str, tf: str, n: int = None) -> pd.DataFrame:
     """
-    Pull the last `n` candles for (symbol, tf) from the shared candle_{tf} collection.
-    Filters by symbol field; datetimes stored as IST-naive, attached with tz_localize.
+    Pull the last `n` candles for (symbol, tf) from the shared candle_{tf}
+    collection, filtering on the symbol field.
+
+    The compound index (symbol ASC, datetime ASC) makes this query efficient —
+    MongoDB can satisfy the symbol equality filter + datetime sort with a
+    single index scan rather than a full collection scan.
+
+    Datetimes are stored as IST-naive; we attach IST timezone via tz_localize.
     """
     from config import HISTORY_LOOKBACK, IST
     if n is None:
@@ -184,18 +191,20 @@ def _load_history_ist(symbol: str, tf: str, n: int = None) -> pd.DataFrame:
     client = MongoClient(MONGO_URI)
     col    = client[MONGO_DB][collection_name(tf)]
 
+    # Hint the compound index so MongoDB always uses it (never COLLSCAN)
     docs = list(
         col.find(
-            {"symbol": symbol},          # filter by symbol field
-            {"_id": 0, "symbol": 0},     # exclude _id and symbol from returned docs
+            {"symbol": symbol},
+            {"_id": 0, "symbol": 0},
             sort=[("datetime", -1)],
-        ).limit(n)
+        )
+        .hint([("symbol", ASCENDING), ("datetime", ASCENDING)])
+        .limit(n)
     )
     if not docs:
         return pd.DataFrame()
 
     df = pd.DataFrame(docs[::-1])
-    # Stored as IST-naive — attach IST timezone directly, no conversion needed
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(IST)
     return df
 

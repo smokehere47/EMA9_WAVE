@@ -10,9 +10,10 @@
 #
 #   Motherwave   — the LARGEST wave by size across all collected waves
 #   2nd-largest  — the second largest wave by size (any type)
-#   3x-smaller   — among all same-type waves (excl. motherwave & 2nd-largest)
-#                  whose size ≤ motherwave.size / 3, pick the one whose size
-#                  is CLOSEST TO motherwave/3 (i.e. the largest qualifying one).
+#   3x-smaller   — ANY wave (any type, normal or counter) that is NOT already
+#                  selected as motherwave or 2nd-largest, whose size is ≤
+#                  motherwave.size / 3, and whose size is CLOSEST TO
+#                  motherwave/3 (i.e. the largest qualifying one).
 #                  Break ties by recency (closest to run-day).
 #
 # Chronological proximity to run-day:
@@ -144,9 +145,8 @@ live_store = LiveCandleStore()
 
 def _get_collection(tf: str, symbol: str | None = None):
     """
-    Return the per-symbol collection  candles_{tf}_{symbol_safe}
-    or fall back to flat candles_{tf} for legacy compatibility.
-    NOTE: main.py patches load_history() at startup — this default is the fallback.
+    Fallback collection accessor.
+    NOTE: main.py patches load_history() at startup with _load_history_ist.
     """
     import re
     client = MongoClient(MONGO_CREDS_FILE)
@@ -160,8 +160,7 @@ def _get_collection(tf: str, symbol: str | None = None):
 def load_history(symbol: str, tf: str, n: int = HISTORY_LOOKBACK) -> pd.DataFrame:
     """
     Pull the last `n` candles from MongoDB (fallback implementation).
-    main.py replaces this at startup with _load_history_ist which uses
-    the correct per-symbol collection and IST-naive datetime handling.
+    main.py replaces this at startup with _load_history_ist.
     """
     col  = _get_collection(tf, symbol)
     docs = list(
@@ -389,17 +388,14 @@ def _identify_waves(
         if idx + 1 < len(normal_raws):
             nw_next = normal_raws[idx + 1]
 
-            # Counter wave: from this wave's high down to next wave's low
-            # high of counter = whichever is higher (nw.high vs nw_next.low)
-            # low  of counter = whichever is lower
             cw_lo_val = min(nw["high"], nw_next["low"])
             cw_hi_val = max(nw["high"], nw_next["low"])
-            cw_lo_dt  = nw["high_dt"]    if nw["high"]     <= nw_next["low"] else nw_next["low_dt"]
-            cw_hi_dt  = nw_next["low_dt"] if nw["high"]    <= nw_next["low"] else nw["high_dt"]
+            cw_lo_dt  = nw["high_dt"]    if nw["high"]  <= nw_next["low"] else nw_next["low_dt"]
+            cw_hi_dt  = nw_next["low_dt"] if nw["high"] <= nw_next["low"] else nw["high_dt"]
 
             all_waves.append(Wave(
                 wave_type = WAVE_COUNTER,
-                wave_num  = wave_num,   # counterWave 1 follows Wave 1, etc.
+                wave_num  = wave_num,
                 low       = cw_lo_val,
                 low_dt    = cw_lo_dt,
                 high      = cw_hi_val,
@@ -421,12 +417,14 @@ def _select_mother_waves(
     """
     Returns (motherwave, second_wave, third_wave).
 
-    Motherwave   = largest size (oldest of the three by design)
-    2nd-largest  = second largest size (any wave type)
-    3x-smaller   = among all same-type waves (excl. motherwave & 2nd-largest)
-                   whose size ≤ motherwave.size / 3, pick the one whose size
-                   is CLOSEST TO motherwave/3 (i.e. the largest qualifying one).
-                   Break ties by recency (closest to run-day).
+    Motherwave   = largest size across ALL waves (normal or counter)
+    2nd-largest  = second largest size across ALL waves (any type)
+    3x-smaller   = ANY wave (normal OR counter — type does NOT matter)
+                   that is NOT already motherwave or 2nd-largest,
+                   whose size ≤ motherwave.size / 3,
+                   and whose size is CLOSEST TO motherwave/3
+                   (i.e. the largest among all qualifying waves).
+                   Break ties by recency (closest to run-day wins).
     """
     if not waves:
         return None, None, None
@@ -440,23 +438,21 @@ def _select_mother_waves(
     if motherwave:
         threshold = motherwave.size / 3.0
 
-        # Collect all qualifying candidates:
-        #   - not already selected as motherwave or 2nd-largest
-        #   - same wave_type as motherwave
-        #   - size <= motherwave.size / 3
+        # Collect ALL qualifying candidates — any wave type allowed.
+        # Only exclusions: already selected as motherwave or 2nd-largest.
         candidates = [
             w for w in waves
             if w is not motherwave
             and w is not second_wave
-            and w.wave_type == motherwave.wave_type
             and w.size <= threshold
         ]
 
         if candidates:
-            # Pick the candidate with size CLOSEST to threshold (largest among qualifiers).
-            # Among candidates with equal size, pick the most recent (last in chrono order).
+            # Pick the candidate whose size is CLOSEST to threshold
+            # (i.e. the largest qualifying size).
+            # Among ties, pick the most recent (newest in chrono order).
             max_qualifying_size = max(c.size for c in candidates)
-            # Iterate newest→oldest; first hit with max_qualifying_size is most recent
+            # reversed(waves) = newest → oldest; first match wins = most recent
             for w in reversed(waves):
                 if w in candidates and w.size == max_qualifying_size:
                     third_wave = w
@@ -470,11 +466,6 @@ def _select_mother_waves(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fmt_selected_wave(display_label: str, w: Wave) -> str:
-    """
-    Motherwave:
-      Wave No. : 3
-      Size: 342.34   Higher High → (2026-04-10 10:15) (3450.75)   Lower Low → (2026-04-08 09:15) (3108.41)
-    """
     return (
         f"{display_label}:\n"
         f"  Wave No. : {w.wave_num}\n"
@@ -485,10 +476,6 @@ def _fmt_selected_wave(display_label: str, w: Wave) -> str:
 
 
 def _fmt_wave_row(w: Wave) -> str:
-    """
-    Wave 2:
-      Size: 57.34   Higher High 2 → (dateTime) (Value)   Lower Low 2 → (dateTime) (Value)
-    """
     if w.wave_type == WAVE_NORMAL:
         row_label = f"Wave {w.wave_num}"
     else:
@@ -503,32 +490,10 @@ def _fmt_wave_row(w: Wave) -> str:
 
 
 def format_signal(sig: dict) -> str:
-    """
-    Render the complete output block for one symbol.
-
-    Stock Name: <SYMBOL>
-    Motherwave:
-      Wave No. : x
-      Size: ...   Higher High → ...   Lower Low → ...
-    2ndlargestwave:
-      Wave No. : x
-      Size: ...
-    3xsmallerwave:
-      Wave No. : x
-      Size: ...
-    Wave 1:
-      Size: ...   Higher High 1 → ...   Lower Low 1 → ...
-    counterWave 1:
-      Size: ...   Higher High 1 → ...   Lower Low 1 → ...
-    Wave 2:
-      ...
-    """
     lines: list[str] = []
 
-    # Header
     lines.append(f"Stock Name: {sig['symbol']}")
 
-    # ── The three selected waves ──────────────────────────────────────────────
     selected = [
         ("_wave_motherwave",  "Motherwave"),
         ("_wave_second_wave", "2ndlargestwave"),
@@ -541,7 +506,6 @@ def format_signal(sig: dict) -> str:
         else:
             lines.append(_fmt_selected_wave(display_label, w))
 
-    # ── Full chronological wave list ─────────────────────────────────────────
     for w in sig.get("_all_waves", []):
         lines.append(_fmt_wave_row(w))
 
@@ -551,7 +515,7 @@ def format_signal(sig: dict) -> str:
 def print_signal(sig: dict) -> None:
     """Print one signal block to stdout."""
     print(format_signal(sig))
-    print()   # blank separator between symbols
+    print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -565,27 +529,7 @@ def scan_symbol(
 ) -> list[dict]:
     """
     Run the Mother Wave identification engine on `df` relative to `target_date`.
-
-    Steps
-    ─────
-    1. Identify up to MOTHERWAVE_LOOKBACK normal waves (+ counter waves)
-       by scanning forward through candles up to target_date.
-    2. Select motherwave (largest), 2nd-largest, 3x-smaller (closest to run-day,
-       same type as motherwave, size ≤ motherwave/3, but LARGEST among qualifiers).
-    3. Return a list with one result dict if a motherwave was found, else [].
-
-    Result dict — serialisable keys (for JSON API & CSV):
-      symbol, scan_date, total_waves_found
-      motherwave_type,  motherwave_wave_num,  motherwave_size,
-      motherwave_low,   motherwave_low_dt,    motherwave_high,  motherwave_high_dt
-      second_wave_type, second_wave_wave_num, second_wave_size, …
-      third_wave_type,  third_wave_wave_num,  third_wave_size,  …
-
-    Private keys (used only by format_signal / print_signal, stripped before JSON):
-      _wave_motherwave   → Wave object
-      _wave_second_wave  → Wave object
-      _wave_third_wave   → Wave object
-      _all_waves         → list[Wave] in chronological order
+    Returns a list with one result dict if a motherwave was found, else [].
     """
     waves = _identify_waves(df, target_date, max_waves=MOTHERWAVE_LOOKBACK)
     if not waves:
@@ -621,12 +565,10 @@ def scan_symbol(
         "scan_date":         str(target_date),
         "total_waves_found": len(waves),
 
-        # Flat serialisable fields (JSON API + CSV)
         **_flat("motherwave",  motherwave),
         **_flat("second_wave", second_wave),
         **_flat("third_wave",  third_wave),
 
-        # Private objects for the terminal formatter (not sent over JSON)
         "_wave_motherwave":  motherwave,
         "_wave_second_wave": second_wave,
         "_wave_third_wave":  third_wave,
@@ -644,12 +586,6 @@ def scan_symbol_live(
     tf:          str,
     target_date: date,
 ) -> list[dict]:
-    """
-    High-level call used by the live scanner loop:
-      1. Snapshot live candles from LiveCandleStore (non-destructive)
-      2. Merge with historical warm-up candles from MongoDB
-      3. Run scan_symbol (mother wave ID) on the merged DataFrame
-    """
     live_candles = live_store.snapshot(symbol)
     df = build_merged_df(symbol, tf, live_candles)
     if df is None:

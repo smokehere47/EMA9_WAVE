@@ -49,6 +49,21 @@ def get_nth_prev_trading_day(ref_date: date, n: int) -> date:
     return d
 
 
+def trading_days_ago(n: int, from_date: date | None = None) -> date:
+    """
+    Return the date that is exactly `n` trading days before `from_date`
+    (defaults to today).  The returned date is itself a trading day.
+
+    Example: trading_days_ago(45) gives the window_start for a 45-trading-day
+    rolling preload window.
+    """
+    ref = from_date if from_date is not None else date.today()
+    # Snap ref to the nearest trading day on or before itself
+    while not is_trading_day(ref):
+        ref -= timedelta(days=1)
+    return get_nth_prev_trading_day(ref, n)
+
+
 def get_last_closed_candle_time(now: datetime) -> datetime:
     tf = int(TIMEFRAME)
     last_trading_day = get_last_trading_day(now)
