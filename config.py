@@ -22,7 +22,7 @@ SYMBOL_COLUMN  = "symbol"
 
 # ── Historical preload batch tuning ───────────────────────────────────────────
 PRELOAD_BATCH_SIZE  = 3    # symbols fetched simultaneously per batch
-PRELOAD_BATCH_PAUSE = 1   # seconds to pause between batches (prevents 429)
+PRELOAD_BATCH_PAUSE = 1    # seconds to pause between batches (prevents 429)
 
 # ── Development mode ──────────────────────────────────────────────────────────
 # DEV_MODE = True  → scan only DEV_SYMBOLS (fast testing, ~5-6 stocks)
@@ -47,8 +47,8 @@ IST = pytz.timezone("Asia/Kolkata")
 
 # ── Candle timeframe ──────────────────────────────────────────────────────────
 # Controls ALL data fetching, EMA calculation, and strategy logic.
-# Valid values: "1", "3", "5"
-TIMEFRAME = "15"   # ← Change to "1" or "5" as needed
+# Valid values: "1", "3", "5", "15", "30", "60" etc.
+TIMEFRAME = "3"   # ← Change to "1" or "5" as needed
 
 # ── How many calendar days of OHLC history to fetch per symbol ────────────────
 FETCH_DAYS = 10
@@ -57,16 +57,10 @@ FETCH_DAYS = 10
 EMA_PERIOD = 9
 
 # ── Fibonacci level ───────────────────────────────────────────────────────────
-# Extension level used for Point(3) breakout confirmation.
-# -0.236 is the standard Fibonacci extension above Point(1).
 FIB_EXTENSION = -0.236
 
 # ── Entry logic flag ─────────────────────────────────────────────────────────
-# Set ENABLE_ENTRY = True to activate entry candle detection after Point(4).
-# Still under development — set False to signal at Point(4) formation only.
-ENABLE_ENTRY = True
-
-# Max candles after Point(4) within which entry candle must appear.
+ENABLE_ENTRY = False
 ENTRY_MAX_CANDLES = 3
 
 # ── Run-day targeting ─────────────────────────────────────────────────────────
@@ -83,67 +77,84 @@ ENTRY_MAX_CANDLES = 3
 # Date range backtest:
 #   OVERRIDE_TRADING_DAY = None
 #   OVERRIDE_DATE_RANGE  = ("2026-03-20", "2026-03-25")
-OVERRIDE_TRADING_DAY = None # "2026-04-23"   # e.g. "2026-04-15"
-OVERRIDE_DATE_RANGE  = None   # e.g. ("2026-03-20", "2026-03-25")
+OVERRIDE_TRADING_DAY =  None #"2026-04-06"
+OVERRIDE_DATE_RANGE  = None #("2026-03-26", "2026-04-06")
 
 # ── Output flags ──────────────────────────────────────────────────────────────
 SEND_TELEGRAM        = False
 SAVE_SIGNALS_TO_CSV  = False
 CSV_OUTPUT_PATH      = r"C:\Users\www.abcom.in\EMA9_Wave\signals.csv"
 
-
 # ── FastAPI server ────────────────────────────────────────────────────────────
 API_HOST = "0.0.0.0"
 API_PORT = 8000
 
-
 # ── MongoDB ────────────────────────────────────────────────────────────────────
-# MongoDB credentials are NOT stored here.
-# They are read at runtime from a plain-text file whose path is set below.
+# Credentials are NOT stored here — read at runtime from a plain-text file.
 #
-# Format of the credentials file (one key=value per line, no quotes):
+# File format (one key=value per line, no quotes):
 #   uri=mongodb://username:password@host:27017
 #   db=EMA9_WAVE
 #
-# If the file contains only a URI line (no db= line), MONGO_DB_DEFAULT is used.
-MONGO_CREDS_FILE = r"C:\Users\www.abcom.in\Ema9_Wave\mongodblocalhost.txt"   # change if running remote Mongo
-MONGO_DB_DEFAULT  = "EMA9_WAVE"
-
-# ── MongoDB collection naming ──────────────────────────────────────────────────
-# Collection name pattern: candle_{tf}
-# e.g. candle_1, candle_15, candle_60
-# Each collection holds ALL symbols for that timeframe.
-# Each document contains: { symbol, datetime, open, high, low, close, volume }
-# Index: unique on (symbol, datetime) per collection.
-MONGO_COLLECTION_PREFIX = "candle"   # results in candle_1, candle_15, etc.
+MONGO_CREDS_FILE        = r"C:\Users\www.abcom.in\Ema9_Wave\mongodblocalhost.txt"
+MONGO_DB_DEFAULT        = "EMA9_WAVE"
+MONGO_COLLECTION_PREFIX = "candle"   # → candle_1, candle_15, candle_60 …
 
 # ── Historical preload ─────────────────────────────────────────────────────────
 #
-# HISTORICAL_PRELOAD_DAYS is in TRADING DAYS (not calendar days).
-# The preloader converts this to the correct calendar date range by walking
-# backwards through the NSE trading calendar.
+# HISTORICAL_PRELOAD_MONTHS  (calendar months, not trading days)
+# ──────────────────────────────────────────────────────────────
+# Controls the initial fetch window for a brand-new / empty database.
 #
-# Rolling window behaviour:
-#   • On each run, only MISSING days are fetched (incremental).
-#   • Any candles older than HISTORICAL_PRELOAD_DAYS trading days are DELETED
-#     so the stored window never grows beyond this limit.
+#   First run (empty DB):
+#     window_start = today − HISTORICAL_PRELOAD_MONTHS months  (simple date math)
+#     The full range  window_start → today  is fetched from Fyers.
 #
-HISTORICAL_PRELOAD_DAYS = 45   # trading days to keep in MongoDB
- 
+#   Every subsequent run (DB already has data):
+#     Only the gap between the last stored candle and today is fetched.
+#       1 day missing  → 1 day fetched
+#       5 days missing → 5 days fetched
+#     Data is NEVER deleted; history grows continuously.
+#
+# Why calendar months instead of trading days?
+#   Trading-day counting was needed in the old rolling-window-prune model
+#   because the prune cutoff had to be expressed as a trading-day boundary.
+#   In accumulation mode:
+#     • The initial window is a one-time calendar subtraction — relativedelta
+#       handles month arithmetic correctly (e.g. Apr 30 − 2 months = Feb 28).
+#     • Incremental updates need no day-counting at all: they simply fetch
+#       from (last_stored_date + 1 calendar day) → today.
+#   There is no reason to convert months → trading days; doing so only
+#   adds complexity and causes the "45-day" confusion you saw.
+#
+HISTORICAL_PRELOAD_MONTHS = 2   # calendar months for the FIRST-RUN fetch window
+
 # All timeframes to store. Add/remove as needed.
 # Valid Fyers resolutions: "1","2","3","5","10","15","20","30","60","120","240"
 HISTORICAL_TIMEFRAMES = ["1", "3", "5", "10", "15", "30", "60"]
- 
-# ── Strategy signal engine ─────────────────────────────────────
-# How many historical candles to pull from MongoDB as EMA warm-up
-# before appending live candles. 50 is enough for EMA-9 stability.
-HISTORY_LOOKBACK = 1850
+
+# ── Adaptive wave fetching ─────────────────────────────────────────────────────
+# Initial candle fetch to bootstrap wave detection.
+# For 1m TF this might need to be larger; for 60m TF smaller.
+INITIAL_FETCH_CANDLES = 200          # first fetch size (candles, not days)
+
+# How many extra candles to add to each adaptive chunk for EMA stability.
+EMA_WARMUP_CANDLES = 27              # 3 × EMA_PERIOD (keep this, rename context only)
+
+# Safety multiplier on predicted chunk size to avoid under-fetching.
+# 1.5 = fetch 50% more than predicted to handle irregular markets.
+ADAPTIVE_FETCH_MULTIPLIER = 1.5
+
+# Hard cap: never fetch more than this many candles in one adaptive chunk.
+ADAPTIVE_MAX_CHUNK = 500
+
+# Hard cap: total candles ever loaded per symbol per scan cycle.
+# Prevents runaway fetching if MOTHERWAVE_LOOKBACK is very high.
+ADAPTIVE_TOTAL_CAP = 5000
 
 # ── Mother Wave identification ─────────────────────────────────────────────────
-# How many waves (back from run-day) to analyse when identifying the motherwave.
-MOTHERWAVE_LOOKBACK = 50
+MOTHERWAVE_LOOKBACK = 60
 
-# ── Chart engine ───────────────────────────────────────────────
+# ── Chart engine ───────────────────────────────────────────────────────────────
 CHART_HOST = "0.0.0.0"
-CHART_PORT = 8001        # separate from main.py's API_PORT (8000)
- 
+CHART_PORT = 8001

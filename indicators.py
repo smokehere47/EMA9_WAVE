@@ -4,6 +4,7 @@
 #
 #   ema9_low   — EMA(9) of candle LOWS   → lower boundary of EMA zone
 #   ema9_high  — EMA(9) of candle HIGHS  → upper boundary of EMA zone
+#   sma20      — SMA(20) of candle CLOSE → used by fractal downtrend logic
 #
 # Fibonacci retracement levels are computed on-demand per wave setup
 # using the fib_levels() helper (no external pyindicator needed —
@@ -24,10 +25,11 @@ from config import EMA_PERIOD, FIB_EXTENSION
 
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add ema9_low and ema9_high columns to the DataFrame."""
+    """Add ema9_low, ema9_high, and sma20 columns to the DataFrame."""
     df = df.copy()
-    df["ema9_low"]  = ta.ema(df["low"],  length=EMA_PERIOD)
-    df["ema9_high"] = ta.ema(df["high"], length=EMA_PERIOD)
+    df["ema9_low"]  = ta.ema(df["low"],   length=EMA_PERIOD)
+    df["ema9_high"] = ta.ema(df["high"],  length=EMA_PERIOD)
+    df["sma20"]     = ta.sma(df["close"], length=20)
     return df
 
 

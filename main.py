@@ -1,25 +1,33 @@
 # ================= MAIN — EMA 9 WAVE SCANNER =================
 #
+# TIMEZONE POLICY:
+# ─────────────────
+#   ALL candle datetimes in MongoDB are stored as IST NAIVE.
+#   "IST naive" means the datetime value is already in Indian Standard Time
+#   but has no tzinfo object attached.
+#
+#   Example: 2026-05-07 09:15:00  (this IS 09:15 IST, not UTC)
+#
+#   Reading:  tz_localize(IST)   → makes it IST-aware for pandas
+#   Writing:  datetime.fromtimestamp(ts, tz=IST).replace(tzinfo=None)
+#             → strips tzinfo but keeps IST value = IST naive
+#
+#   WebSocket: dt_ist.replace(tzinfo=None) = IST naive → MongoDB
+#   This matches exactly what historical_preload.py stores.
+#   No conversions, no UTC, no offset math — ever.
+#
 # Architecture (live mode):
-#   • historical_preload.py  → Fyers REST → MongoDB  (run once at startup)
-#   • Fyers WebSocket        → live candle ticks → LiveCandleStore (strategy.py)
-#   • Scanner loop           → MongoDB (last HISTORY_LOOKBACK candles) + WebSocket buffer
+#   • historical_preload.py  → Fyers REST → MongoDB (IST naive)
+#   • Fyers WebSocket        → live ticks → LiveCandleStore (RAM)
+#                              + MongoDB (IST naive, upserted per tick)
+#   • Scanner loop           → _adaptive_load_history (MongoDB, IST naive)
+#                              + live_store.snapshot → merged IST-aware df
 #                              → scan_symbol() → signals
-#   • ZERO Fyers REST API calls during scan cycle
-#
-# Backtest mode: reads purely from MongoDB, no WebSocket needed.
-#
-# MongoDB layout:
-#   DB  : EMA_wave
-#   Collections: candle_{tf}  (one per timeframe, all symbols inside)
-#   e.g. candle_1, candle_15, candle_60
-#   Each document: { symbol, datetime (IST naive), open, high, low, close, volume }
-#   Index: unique compound on (symbol ASC, datetime ASC) per collection.
 #
 # FastAPI routes:
 #   GET  /         → health
 #   GET  /signals  → latest scan results (JSON)
-#   WS   /ws       → real-time signal push per signal
+#   WS   /ws       → real-time signal push
 #
 # Run:
 #   python historical_preload.py   # once before first live run
@@ -30,7 +38,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import signal
 import sys
 import time
@@ -38,6 +45,7 @@ import threading
 from datetime import datetime, timedelta, date as _date
 from typing import Any
 
+import pytz
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -47,7 +55,9 @@ from config import (
     SAVE_SIGNALS_TO_CSV, CSV_OUTPUT_PATH,
     SEND_TELEGRAM, OVERRIDE_TRADING_DAY, OVERRIDE_DATE_RANGE,
     API_HOST, API_PORT,
-    HISTORY_LOOKBACK, HISTORICAL_TIMEFRAMES,
+    INITIAL_FETCH_CANDLES, EMA_WARMUP_CANDLES,
+    ADAPTIVE_FETCH_MULTIPLIER, ADAPTIVE_MAX_CHUNK, ADAPTIVE_TOTAL_CAP,
+    MOTHERWAVE_LOOKBACK, HISTORICAL_TIMEFRAMES,
     MONGO_CREDS_FILE, MONGO_DB_DEFAULT, MONGO_COLLECTION_PREFIX,
 )
 from fyers_client import get_fyers
@@ -56,33 +66,29 @@ from time_utils import get_last_trading_day, get_last_closed_candle_time, is_tra
 from strategy import scan_symbol, build_merged_df, live_store
 import strategy as _strategy
 from signal_formatter import print_scan_summary
-from strategy import print_signal   # strategy owns the formatter now
+from strategy import print_signal
 
 if SEND_TELEGRAM:
     from telegram_utils import send_signal, send_startup_message
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global stop event — set on Ctrl+C / SIGTERM to cleanly stop all threads
+# Global stop event
 # ─────────────────────────────────────────────────────────────────────────────
 
 _stop_event  = threading.Event()
-_ws_instance = None   # Fyers WebSocket reference for clean close on shutdown
+_ws_instance = None
 
 
 def _shutdown(sig, frame):
-    """Signal handler for SIGINT / SIGTERM — stops all threads cleanly."""
     print("\n\n  Shutting down (Ctrl+C)…")
     _stop_event.set()
-
     global _ws_instance
     if _ws_instance is not None:
         try:
             _ws_instance.close()
         except Exception:
             pass
-
-    # Hard kill after 3 s if threads are still lingering
     threading.Timer(3.0, lambda: os._exit(0)).start()
 
 
@@ -95,31 +101,20 @@ signal.signal(signal.SIGTERM, _shutdown)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _public(sig: dict) -> dict:
-    """Return a copy of the signal dict with all private '_*' keys removed."""
     return {k: v for k, v in sig.items() if not k.startswith("_")}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MongoDB credentials — loaded from plain-text file (no creds in source code)
+# MongoDB credentials
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_mongo_creds(creds_file: str) -> tuple[str, str]:
-    """
-    Read MongoDB URI and database name from a plain-text credentials file.
-
-    Expected file format (one key=value per line, no quotes needed):
-        uri=mongodb://username:password@host:27017
-        db=EMA_wave
-
-    Returns (uri, db_name).  Raises FileNotFoundError / ValueError on failure.
-    """
     creds_path = os.path.abspath(creds_file)
     if not os.path.isfile(creds_path):
         raise FileNotFoundError(
             f"MongoDB credentials file not found: {creds_path}\n"
             f"Create the file with:\n  uri=mongodb://<host>:<port>\n  db=<database_name>"
         )
-
     parsed: dict[str, str] = {}
     with open(creds_path, "r", encoding="utf-8") as fh:
         for raw_line in fh:
@@ -130,18 +125,13 @@ def _load_mongo_creds(creds_file: str) -> tuple[str, str]:
                 continue
             key, _, value = line.partition("=")
             parsed[key.strip().lower()] = value.strip()
-
     uri = parsed.get("uri", "")
     if not uri:
-        raise ValueError(
-            f"'uri' key missing in credentials file: {creds_path}"
-        )
-
+        raise ValueError(f"'uri' key missing in credentials file: {creds_path}")
     db_name = parsed.get("db", MONGO_DB_DEFAULT)
     return uri, db_name
 
 
-# Load at import time so the rest of the module can use MONGO_URI / MONGO_DB
 try:
     MONGO_URI, MONGO_DB = _load_mongo_creds(MONGO_CREDS_FILE)
     print(f"  [MongoDB] Credentials loaded from: {MONGO_CREDS_FILE}")
@@ -156,66 +146,190 @@ except (FileNotFoundError, ValueError) as _creds_err:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def collection_name(tf: str) -> str:
-    """
-    Return the MongoDB collection name for a given timeframe.
-    Pattern:  candle_{tf}
-    Example:  candle_15   (holds ALL symbols for the 15-min TF)
-    Compound index on (symbol, datetime) is created by historical_preload.py.
-    """
     return f"{MONGO_COLLECTION_PREFIX}_{tf}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Patch strategy.load_history to use candle_{tf} collections + compound index
+# Shared live MongoDB client + WebSocket candle persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+_live_mongo_client = None
+
+
+def _get_live_mongo_col():
+    global _live_mongo_client
+    if _live_mongo_client is None:
+        from pymongo import MongoClient
+        _live_mongo_client = MongoClient(MONGO_URI)
+    return _live_mongo_client[MONGO_DB][collection_name(TIMEFRAME)]
+
+
+def _persist_live_candle(symbol: str, candle: dict, dt_ist: datetime) -> None:
+    """
+    Upsert one live candle into MongoDB as IST naive.
+
+    Why IST naive (not UTC):
+    dt_ist is an IST-aware datetime from the WebSocket handler.
+    .replace(tzinfo=None) strips the timezone info but keeps the IST value.
+    This is identical to what historical_preload.py stores (also IST naive).
+    The unique compound index (symbol, datetime) ensures no duplicates.
+
+    Why $set (not $setOnInsert like historical):
+    Live candles are built tick-by-tick during the candle's open period.
+    Each tick updates OHLCV of the SAME candle (same open timestamp).
+    We always want the latest values → $set overwrites previous tick.
+    Historical candles are final (closed bars) → $setOnInsert never overwrites.
+    """
+    try:
+        col = _get_live_mongo_col()
+        # IST aware → IST naive (strip tzinfo, keep IST value)
+        dt_ist_naive = dt_ist.replace(tzinfo=None)
+        col.update_one(
+            {"symbol": symbol, "datetime": dt_ist_naive},
+            {"$set": {
+                "symbol":   symbol,
+                "datetime": dt_ist_naive,
+                "open":     candle["open"],
+                "high":     candle["high"],
+                "low":      candle["low"],
+                "close":    candle["close"],
+                "volume":   candle["volume"],
+            }},
+            upsert=True,
+        )
+    except Exception:
+        pass   # never crash the WebSocket feed on a DB write failure
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Adaptive candle loader — patches strategy.load_history
 # ─────────────────────────────────────────────────────────────────────────────
 
 from pymongo import MongoClient, ASCENDING
 import pandas as pd
 
 
-def _load_history_ist(symbol: str, tf: str, n: int = None) -> pd.DataFrame:
+def _count_pivot_clusters_from_docs(docs: list[dict]) -> int:
     """
-    Pull the last `n` candles for (symbol, tf) from the shared candle_{tf}
-    collection, filtering on the symbol field.
-
-    The compound index (symbol ASC, datetime ASC) makes this query efficient —
-    MongoDB can satisfy the symbol equality filter + datetime sort with a
-    single index scan rather than a full collection scan.
-
-    Datetimes are stored as IST-naive; we attach IST timezone via tz_localize.
+    Fast proxy cluster counter using EMA-9 on close as approximation of ema9_low.
+    docs are in newest-first order; we reverse for EMA calculation.
+    Used only to decide if more candle data is needed — not for actual wave detection.
+    Accuracy is intentionally approximate — only the count threshold matters.
     """
-    from config import HISTORY_LOOKBACK, IST
-    if n is None:
-        n = HISTORY_LOOKBACK
+    if len(docs) < 9:
+        return 0
 
+    rows   = list(reversed(docs))   # chronological
+    closes = [r["close"] for r in rows]
+
+    k   = 2.0 / (9 + 1)
+    ema = closes[0]
+    ema_values = [ema]
+    for c in closes[1:]:
+        ema = c * k + ema * (1 - k)
+        ema_values.append(ema)
+
+    cluster_count = 0
+    in_cluster    = False
+    for i, row in enumerate(rows):
+        body_low = min(row["open"], row["close"])
+        below    = body_low < ema_values[i]
+        if below and not in_cluster:
+            cluster_count += 1
+            in_cluster = True
+        elif not below:
+            in_cluster = False
+
+    return cluster_count
+
+
+def _adaptive_load_history(symbol: str, tf: str, n: int = None) -> pd.DataFrame:
+    """
+    Adaptive candle loader: fetches from MongoDB newest→oldest in chunks,
+    stopping when enough pivot clusters exist to form MOTHERWAVE_LOOKBACK waves.
+
+    TIMEZONE: MongoDB stores IST naive datetimes.
+    We read them and do tz_localize(IST) to make them IST-aware for pandas.
+    This is the correct and only timezone operation needed.
+
+    Chunk sizing:
+    - First fetch: INITIAL_FETCH_CANDLES + EMA_WARMUP_CANDLES
+    - Subsequent: predict based on observed candles-per-cluster ratio
+    - Apply ADAPTIVE_FETCH_MULTIPLIER safety buffer
+    - Cap each chunk at ADAPTIVE_MAX_CHUNK
+    - Stop at ADAPTIVE_TOTAL_CAP total candles
+    """
     client = MongoClient(MONGO_URI)
     col    = client[MONGO_DB][collection_name(tf)]
 
-    # Hint the compound index so MongoDB always uses it (never COLLSCAN)
+    required_clusters = MOTHERWAVE_LOOKBACK + 1
+    all_docs: list[dict] = []
+
+    # ── First fetch ───────────────────────────────────────────────────────────
+    first_size = INITIAL_FETCH_CANDLES + EMA_WARMUP_CANDLES
     docs = list(
         col.find(
             {"symbol": symbol},
             {"_id": 0, "symbol": 0},
             sort=[("datetime", -1)],
-        )
-        .hint([("symbol", ASCENDING), ("datetime", ASCENDING)])
-        .limit(n)
+        ).limit(first_size)
     )
+
     if not docs:
         return pd.DataFrame()
 
-    df = pd.DataFrame(docs[::-1])
+    all_docs       = docs   # newest-first
+    total_fetched  = len(docs)
+    clusters_found = _count_pivot_clusters_from_docs(all_docs)
+
+    # ── Adaptive expansion ────────────────────────────────────────────────────
+    while clusters_found < required_clusters and total_fetched < ADAPTIVE_TOTAL_CAP:
+        remaining = required_clusters - clusters_found
+
+        if clusters_found > 0:
+            candles_per_cluster = total_fetched / clusters_found
+            predicted = int(remaining * candles_per_cluster * ADAPTIVE_FETCH_MULTIPLIER)
+        else:
+            predicted = INITIAL_FETCH_CANDLES * 2
+
+        chunk_size = min(max(predicted, 50), ADAPTIVE_MAX_CHUNK) + EMA_WARMUP_CANDLES
+
+        oldest_dt = all_docs[-1]["datetime"]   # docs are newest-first → last = oldest
+
+        new_docs = list(
+            col.find(
+                {"symbol": symbol, "datetime": {"$lt": oldest_dt}},
+                {"_id": 0, "symbol": 0},
+                sort=[("datetime", -1)],
+            ).limit(chunk_size)
+        )
+
+        if not new_docs:
+            break
+
+        all_docs.extend(new_docs)
+        total_fetched  = len(all_docs)
+        clusters_found = _count_pivot_clusters_from_docs(all_docs)
+
+    if not all_docs:
+        return pd.DataFrame()
+
+    # Convert to chronological order; localize IST naive → IST-aware
+    df = pd.DataFrame(all_docs[::-1])
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(IST)
     return df
 
 
-_strategy.load_history = _load_history_ist
+# Patch strategy.load_history with the adaptive IST-naive version
+_strategy.load_history = _adaptive_load_history
 
 
-# ── FastAPI ───────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# FastAPI app
+# ─────────────────────────────────────────────────────────────────────────────
+
 app = FastAPI(title="EMA 9 Wave Scanner", version="2.0.0")
 
-# ── Shared state ──────────────────────────────────────────────────────────────
 _latest_signals: list[dict] = []
 _state_lock   = threading.Lock()
 _ws_clients:  list[WebSocket] = []
@@ -240,15 +354,10 @@ if SEND_TELEGRAM:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WebSocket feed — started only in LIVE mode
+# WebSocket feed
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _start_websocket_feed():
-    """
-    Connect Fyers WebSocket and pipe ticks into live_store.
-    Runs in its own daemon thread.
-    Stops cleanly when _stop_event is set.
-    """
     global _ws_instance
     try:
         from fyers_apiv3.FyersWebsocket import data_ws
@@ -260,12 +369,19 @@ def _start_websocket_feed():
             if _stop_event.is_set():
                 return
             try:
-                sym  = msg.get("symbol", "")
-                ltp  = msg.get("ltp", 0.0)
-                ts   = msg.get("timestamp", 0)
+                sym = msg.get("symbol", "")
+                ltp = msg.get("ltp", 0.0)
+                ts  = msg.get("timestamp", 0)
+
+                # Snap to candle open timestamp for this timeframe
                 candle_open_ts = (ts // (tf_int * 60)) * (tf_int * 60)
+
+                # IST-aware datetime for the candle open
                 dt_ist = datetime.fromtimestamp(candle_open_ts, tz=IST)
+
                 candle = {
+                    # Store IST isoformat string in live_store
+                    # _live_candles_to_df in strategy.py knows how to parse this
                     "datetime": dt_ist.isoformat(),
                     "open":     msg.get("open_price", ltp),
                     "high":     msg.get("high_price", ltp),
@@ -273,7 +389,13 @@ def _start_websocket_feed():
                     "close":    ltp,
                     "volume":   msg.get("vol_traded_today", 0),
                 }
+
+                # Push to in-memory live store
                 live_store.push(sym, candle)
+
+                # Persist to MongoDB as IST naive
+                _persist_live_candle(sym, candle, dt_ist)
+
             except Exception:
                 pass
 
@@ -307,7 +429,6 @@ def _start_websocket_feed():
         )
 
         _ws_instance = ws
-
         if not _stop_event.is_set():
             ws.connect()
 
@@ -318,7 +439,7 @@ def _start_websocket_feed():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scan one symbol (MongoDB + live buffer)
+# Scan one symbol
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scan_symbol(symbol: str, target_date: _date, is_live: bool = False) -> list[dict]:
@@ -354,7 +475,7 @@ def _broadcast_sync(data: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# run_one_day — no Fyers REST calls
+# run_one_day
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_one_day(
@@ -368,12 +489,13 @@ def run_one_day(
     is_live  = not is_backtest
 
     if not is_range:
-        print(f"\n  {'=' * 55}")
+        print(f"\n  {'=' * 60}")
         print(f"  Target date : {target_date}  {mode_tag}")
         print(f"  Symbols     : {len(symbols)}")
-        print(f"  Data source : MongoDB ({collection_name(TIMEFRAME)}) last {HISTORY_LOOKBACK} candles" +
-              (" + WebSocket" if is_live else ""))
-        print(f"  {'=' * 55}")
+        print(f"  Data source : MongoDB ({collection_name(TIMEFRAME)}) "
+              f"adaptive fetch (target {MOTHERWAVE_LOOKBACK} waves) + {EMA_WARMUP_CANDLES} EMA warm-up"
+              + (" + WebSocket" if is_live else ""))
+        print(f"  {'=' * 60}")
 
     t0      = time.time()
     results = []
@@ -449,13 +571,6 @@ def _save_csv(signals: list[dict]) -> None:
 # Backtest helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _eod_dt(d: _date) -> datetime:
-    return IST.localize(
-        datetime.combine(d, datetime.min.time())
-        .replace(hour=15, minute=30)
-    )
-
-
 def _backtest_dates() -> list[_date]:
     if RUN_MODE == "SINGLE":
         return [_date.fromisoformat(OVERRIDE_TRADING_DAY)]
@@ -483,7 +598,6 @@ def _scanner_loop():
         print(f"\n  Backtest complete — {len(dates)} day(s) processed.\n")
         return
 
-    # LIVE mode — wait for each candle close then scan
     last_processed = None
     tf_int = int(TIMEFRAME)
 
@@ -557,7 +671,7 @@ async def startup_event():
     if RUN_MODE == "LIVE":
         ws_thread = threading.Thread(target=_start_websocket_feed, daemon=True)
         ws_thread.start()
-        time.sleep(2)   # give WS a moment to connect before first scan
+        time.sleep(2)
 
     scanner_thread = threading.Thread(target=_scanner_loop, daemon=True)
     scanner_thread.start()
