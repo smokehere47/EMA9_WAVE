@@ -27,7 +27,7 @@ PRELOAD_BATCH_PAUSE = 1    # seconds to pause between batches (prevents 429)
 # ── Development mode ──────────────────────────────────────────────────────────
 # DEV_MODE = True  → scan only DEV_SYMBOLS (fast testing, ~5-6 stocks)
 # DEV_MODE = False → scan all stocks from INPUT_EXCEL (production)
-DEV_MODE = True
+DEV_MODE = False
 DEV_SYMBOLS = [
     # "NSE:ZYDUSLIFE-EQ",
     # "NSE:YESBANK-EQ",
@@ -133,27 +133,8 @@ HISTORICAL_PRELOAD_MONTHS = 2   # calendar months for the FIRST-RUN fetch window
 # Valid Fyers resolutions: "1","2","3","5","10","15","20","30","60","120","240"
 HISTORICAL_TIMEFRAMES = ["1", "3", "5", "10", "15", "30", "60"]
 
-# ── Adaptive wave fetching ─────────────────────────────────────────────────────
-# Initial candle fetch to bootstrap wave detection.
-# For 1m TF this might need to be larger; for 60m TF smaller.
-INITIAL_FETCH_CANDLES = 200          # first fetch size (candles, not days)
-
-# How many extra candles to add to each adaptive chunk for EMA stability.
-EMA_WARMUP_CANDLES = 27              # 3 × EMA_PERIOD (keep this, rename context only)
-
-# Safety multiplier on predicted chunk size to avoid under-fetching.
-# 1.5 = fetch 50% more than predicted to handle irregular markets.
-ADAPTIVE_FETCH_MULTIPLIER = 1.5
-
-# Hard cap: never fetch more than this many candles in one adaptive chunk.
-ADAPTIVE_MAX_CHUNK = 500
-
-# Hard cap: total candles ever loaded per symbol per scan cycle.
-# Prevents runaway fetching if MOTHERWAVE_LOOKBACK is very high.
-ADAPTIVE_TOTAL_CAP = 5000
-
-# ── Mother Wave identification ─────────────────────────────────────────────────
-MOTHERWAVE_LOOKBACK = 60
+WAVE_LOOKBACK_DAYS  = 15   # trading days of candle history to fetch
+WAVE_OUTPUT_COUNT   = 100   # rolling window — max waves shown in output
 
 # ── Chart engine ───────────────────────────────────────────────────────────────
 CHART_HOST = "0.0.0.0"

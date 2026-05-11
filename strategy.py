@@ -54,7 +54,6 @@ from pymongo import MongoClient, ASCENDING
 
 from config import (
     IST,
-    MOTHERWAVE_LOOKBACK,
     MONGO_CREDS_FILE,
     MONGO_DB_DEFAULT,
 )
@@ -300,27 +299,31 @@ def _sma20(row: dict) -> float | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core: identify waves (reverse scan — Wave 1 = latest, Wave N = oldest)
+# Core: identify waves (forward scan — Wave 1 = latest, Wave N = oldest)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _identify_waves_reverse(
+def _identify_waves_forward(
     df:          pd.DataFrame,
     target_date: date,
-    max_waves:   int,
 ) -> list[Wave]:
     """
-    Scan BACKWARD from target_date collecting up to max_waves normal (up) waves.
+    Scan FORWARD oldest → latest collecting up and down waves.
 
-    Wave 1  = most recent wave (closest to target_date / run day)
-    Wave N  = oldest wave
+    Wave detection:
+      - A pivot LOW cluster = consecutive candles where body_low < ema9_low.
+        The lowest body_low in the cluster is the pivot low.
+      - Between two consecutive pivot low clusters, the highest candle
+        where high > ema9_high is the wave high.
+        If no candle clears ema9_high the segment is skipped (hard rule).
 
-    Collection order: newest → oldest (stops at max_waves).
-    Output order: chronological (oldest first) for display.
-    Wave numbers: Wave 1 assigned to newest, Wave N to oldest.
+    Wave numbering:
+      Wave 1 = most recent, Wave N = oldest (assigned after collection).
 
-    Pass 1: collect normal (up) waves newest → oldest via pivot cluster pairs.
-    Pass 2: interleave down-waves between every consecutive pair of up-waves.
+    Output: chronological list of up-waves and interleaved down-waves,
+            trimmed to latest WAVE_OUTPUT_COUNT waves.
     """
+    from config import WAVE_OUTPUT_COUNT
+
     df_scan = df[df["datetime"].dt.date <= target_date].reset_index(drop=True)
     if df_scan.empty:
         return []
@@ -328,13 +331,13 @@ def _identify_waves_reverse(
     rows = df_scan.to_dict("records")
     n    = len(rows)
 
-    # Mark: is body-low below ema9_low?
+    # ── Mark below-EMA9-low ───────────────────────────────────────────────
     below: list[bool] = []
     for row in rows:
         ema_l = _ema9_low(row)
         below.append(False if ema_l is None else _body_low(row) < ema_l)
 
-    # Build pivot clusters (consecutive below-EMA runs)
+    # ── Build pivot low clusters (consecutive below-EMA runs) ─────────────
     clusters: list[tuple[int, int]] = []
     i = 0
     while i < n:
@@ -350,7 +353,7 @@ def _identify_waves_reverse(
     if len(clusters) < 2:
         return []
 
-    # Per cluster: pivot low = candle with lowest body-low
+    # ── Per cluster: pivot low = candle with lowest body_low ──────────────
     pivots: list[dict] = []
     for c_start, c_end in clusters:
         best_idx  = c_start
@@ -367,12 +370,12 @@ def _identify_waves_reverse(
             "low_dt":        _dt_str(rows[best_idx]["datetime"]),
         })
 
-    # ── Pass 1: collect normal waves newest → oldest ───────────────────────
-    normal_raws_reversed: list[dict] = []
+    # ── Collect up-waves forward (oldest → latest) ────────────────────────
+    up_waves_raw: list[dict] = []
 
-    for p_idx in range(len(pivots) - 1, 0, -1):
-        p_curr = pivots[p_idx - 1]   # older pivot (left)
-        p_next = pivots[p_idx]       # newer pivot (right)
+    for p_idx in range(len(pivots) - 1):
+        p_curr = pivots[p_idx]       # left (older) pivot
+        p_next = pivots[p_idx + 1]   # right (newer) pivot
 
         seg_start = p_curr["cluster_end"] + 1
         seg_end   = p_next["cluster_start"] - 1
@@ -380,14 +383,24 @@ def _identify_waves_reverse(
         if seg_start > seg_end:
             continue
 
-        wave_high    = rows[seg_start]["high"]
-        wave_high_dt = _dt_str(rows[seg_start]["datetime"])
-        for k in range(seg_start + 1, seg_end + 1):
-            if rows[k]["high"] > wave_high:
-                wave_high    = rows[k]["high"]
-                wave_high_dt = _dt_str(rows[k]["datetime"])
+        # ── Hard rule: wave high must have high > ema9_high ───────────────
+        wave_high    = None
+        wave_high_dt = None
 
-        normal_raws_reversed.append({
+        for k in range(seg_start, seg_end + 1):
+            ema_h_k = _ema9_high(rows[k])
+            if ema_h_k is None:
+                continue
+            if rows[k]["high"] > ema_h_k:
+                if wave_high is None or rows[k]["high"] > wave_high:
+                    wave_high    = rows[k]["high"]
+                    wave_high_dt = _dt_str(rows[k]["datetime"])
+
+        if wave_high is None:
+            # No candle cleared ema9_high — skip this segment (hard rule)
+            continue
+
+        up_waves_raw.append({
             "low":     p_curr["low"],
             "low_dt":  p_curr["low_dt"],
             "high":    wave_high,
@@ -395,46 +408,45 @@ def _identify_waves_reverse(
             "size":    abs(wave_high - p_curr["low"]),
         })
 
-        if len(normal_raws_reversed) >= max_waves:
-            break
-
-    if not normal_raws_reversed:
+    if not up_waves_raw:
         return []
 
     # ── Assign wave numbers: Wave 1 = newest, Wave N = oldest ─────────────
-    all_waves_up: list[dict] = []
-    for idx, nw in enumerate(normal_raws_reversed):
-        wave_num = idx + 1
-        all_waves_up.append({**nw, "wave_num": wave_num})
-
-    all_waves_up = list(reversed(all_waves_up))
-
-    # ── Pass 2: interleave down-waves in chronological order ───────────────
-    result_waves: list[Wave] = []
-    for idx, nw in enumerate(all_waves_up):
-        result_waves.append(Wave(
+    total = len(up_waves_raw)
+    all_up: list[Wave] = []
+    for idx, uw in enumerate(up_waves_raw):
+        wave_num = total - idx
+        all_up.append(Wave(
             wave_type = WAVE_UP,
-            wave_num  = nw["wave_num"],
-            low       = nw["low"],
-            low_dt    = nw["low_dt"],
-            high      = nw["high"],
-            high_dt   = nw["high_dt"],
-            size      = nw["size"],
+            wave_num  = wave_num,
+            low       = uw["low"],
+            low_dt    = uw["low_dt"],
+            high      = uw["high"],
+            high_dt   = uw["high_dt"],
+            size      = uw["size"],
         ))
-        if idx + 1 < len(all_waves_up):
-            nw_next = all_waves_up[idx + 1]
+
+    # ── Interleave down-waves ─────────────────────────────────────────────
+    result_waves: list[Wave] = []
+    for idx, uw in enumerate(all_up):
+        result_waves.append(uw)
+        if idx + 1 < len(all_up):
+            nxt = all_up[idx + 1]
             result_waves.append(Wave(
                 wave_type = WAVE_DOWN,
-                wave_num  = nw["wave_num"],
-                low       = nw_next["low"],
-                low_dt    = nw_next["low_dt"],
-                high      = nw["high"],
-                high_dt   = nw["high_dt"],
-                size      = abs(nw["high"] - nw_next["low"]),
+                wave_num  = uw.wave_num,
+                low       = nxt.low,
+                low_dt    = nxt.low_dt,
+                high      = uw.high,
+                high_dt   = uw.high_dt,
+                size      = abs(uw.high - nxt.low),
             ))
 
-    return result_waves
+    # ── Rolling window: keep only latest WAVE_OUTPUT_COUNT waves ──────────
+    if len(result_waves) > WAVE_OUTPUT_COUNT:
+        result_waves = result_waves[-WAVE_OUTPUT_COUNT:]
 
+    return result_waves
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mother Wave selection
@@ -539,6 +551,11 @@ def _find_fractal_signals(
         if not (c2_body_low > c1_body_low and c2_body_low > c3_body_low):
             i += 1
             continue
+        
+        # ── Wick low condition: C2 low must be above C1 low and C3 low ───────────
+        if not (c2_row["low"] > c1["low"] and c2_row["low"] > c3["low"]):
+            i += 1
+            continue
 
         # ── Rule 3: SMA20 condition — only C2's high vs C2's own SMA20 ───────
         sma   = _sma20(c2_row)
@@ -554,16 +571,32 @@ def _find_fractal_signals(
             i = mid_end + 2
             continue
 
-        # ── All rules passed — record the fractal ─────────────────────────────
-        # wave_low = lowest candle LOW from seg_rows[0] up to (and including) i-1
-        # i.e. the lowest point the price reached BEFORE the fractal high (C2).
-        # This is the "floor" the fractal spike sits above.
-        wave_low     = seg_rows[0]["low"]
+        # ── Wave low: lowest `low` where close < ema9_low (soft fallback) ────
+        # Primary: find candle with lowest `low` that also closes below ema9_low.
+        # Fallback: if no candle meets the close condition, use lowest `low` as-is.
+
+        wave_low     = None
         wave_low_idx = 0
-        for k in range(1, i):
-            if seg_rows[k]["low"] < wave_low:
-                wave_low     = seg_rows[k]["low"]
-                wave_low_idx = k
+
+        # ── Pass 1: primary — lowest low with close < ema9_low ───────────────
+        for k in range(0, i):
+            row_k  = seg_rows[k]
+            ema_l_k = _ema9_low(row_k)
+            if ema_l_k is None:
+                continue
+            if row_k["close"] < ema_l_k:
+                if wave_low is None or row_k["low"] < wave_low:
+                    wave_low     = row_k["low"]
+                    wave_low_idx = k
+
+        # ── Pass 2: fallback — lowest low unconditionally ────────────────────
+        if wave_low is None:
+            wave_low     = seg_rows[0]["low"]
+            wave_low_idx = 0
+            for k in range(1, i):
+                if seg_rows[k]["low"] < wave_low:
+                    wave_low     = seg_rows[k]["low"]
+                    wave_low_idx = k
 
         signals.append(FractalSignal(
             high        = c2_high,
@@ -653,7 +686,7 @@ def scan_symbol(
     df:          pd.DataFrame,
     target_date: date,
 ) -> list[dict]:
-    waves = _identify_waves_reverse(df, target_date, max_waves=MOTHERWAVE_LOOKBACK)
+    waves = _identify_waves_forward(df, target_date)
     if not waves:
         return []
 

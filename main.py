@@ -44,6 +44,7 @@ import time
 import threading
 from datetime import datetime, timedelta, date as _date
 from typing import Any
+import pandas as pd
 
 import pytz
 import uvicorn
@@ -55,10 +56,8 @@ from config import (
     SAVE_SIGNALS_TO_CSV, CSV_OUTPUT_PATH,
     SEND_TELEGRAM, OVERRIDE_TRADING_DAY, OVERRIDE_DATE_RANGE,
     API_HOST, API_PORT,
-    INITIAL_FETCH_CANDLES, EMA_WARMUP_CANDLES,
-    ADAPTIVE_FETCH_MULTIPLIER, ADAPTIVE_MAX_CHUNK, ADAPTIVE_TOTAL_CAP,
-    MOTHERWAVE_LOOKBACK, HISTORICAL_TIMEFRAMES,
-    MONGO_CREDS_FILE, MONGO_DB_DEFAULT, MONGO_COLLECTION_PREFIX,
+    HISTORICAL_TIMEFRAMES,
+    MONGO_CREDS_FILE, MONGO_DB_DEFAULT, MONGO_COLLECTION_PREFIX, WAVE_LOOKBACK_DAYS,
 )
 from fyers_client import get_fyers
 from symbol_loader import load_symbols
@@ -205,123 +204,39 @@ def _persist_live_candle(symbol: str, candle: dict, dt_ist: datetime) -> None:
 # Adaptive candle loader — patches strategy.load_history
 # ─────────────────────────────────────────────────────────────────────────────
 
-from pymongo import MongoClient, ASCENDING
-import pandas as pd
-
-
-def _count_pivot_clusters_from_docs(docs: list[dict]) -> int:
+def _simple_load_history(symbol: str, tf: str, n: int = None) -> pd.DataFrame:
     """
-    Fast proxy cluster counter using EMA-9 on close as approximation of ema9_low.
-    docs are in newest-first order; we reverse for EMA calculation.
-    Used only to decide if more candle data is needed — not for actual wave detection.
-    Accuracy is intentionally approximate — only the count threshold matters.
-    """
-    if len(docs) < 9:
-        return 0
-
-    rows   = list(reversed(docs))   # chronological
-    closes = [r["close"] for r in rows]
-
-    k   = 2.0 / (9 + 1)
-    ema = closes[0]
-    ema_values = [ema]
-    for c in closes[1:]:
-        ema = c * k + ema * (1 - k)
-        ema_values.append(ema)
-
-    cluster_count = 0
-    in_cluster    = False
-    for i, row in enumerate(rows):
-        body_low = min(row["open"], row["close"])
-        below    = body_low < ema_values[i]
-        if below and not in_cluster:
-            cluster_count += 1
-            in_cluster = True
-        elif not below:
-            in_cluster = False
-
-    return cluster_count
-
-
-def _adaptive_load_history(symbol: str, tf: str, n: int = None) -> pd.DataFrame:
-    """
-    Adaptive candle loader: fetches from MongoDB newest→oldest in chunks,
-    stopping when enough pivot clusters exist to form MOTHERWAVE_LOOKBACK waves.
+    Simple loader: fetches candles for the last WAVE_LOOKBACK_DAYS trading days
+    from MongoDB. Returns chronological order (oldest → latest), IST-aware.
 
     TIMEZONE: MongoDB stores IST naive datetimes.
-    We read them and do tz_localize(IST) to make them IST-aware for pandas.
-    This is the correct and only timezone operation needed.
-
-    Chunk sizing:
-    - First fetch: INITIAL_FETCH_CANDLES + EMA_WARMUP_CANDLES
-    - Subsequent: predict based on observed candles-per-cluster ratio
-    - Apply ADAPTIVE_FETCH_MULTIPLIER safety buffer
-    - Cap each chunk at ADAPTIVE_MAX_CHUNK
-    - Stop at ADAPTIVE_TOTAL_CAP total candles
+    tz_localize(IST) makes them IST-aware for pandas — same as before.
     """
-    client = MongoClient(MONGO_URI)
-    col    = client[MONGO_DB][collection_name(tf)]
+    from pymongo import MongoClient
+    from time_utils import get_trading_day_start
 
-    required_clusters = MOTHERWAVE_LOOKBACK + 1
-    all_docs: list[dict] = []
+    client  = MongoClient(MONGO_URI)
+    col     = client[MONGO_DB][collection_name(tf)]
 
-    # ── First fetch ───────────────────────────────────────────────────────────
-    first_size = INITIAL_FETCH_CANDLES + EMA_WARMUP_CANDLES
+    cutoff  = get_trading_day_start(WAVE_LOOKBACK_DAYS)
+
     docs = list(
         col.find(
-            {"symbol": symbol},
+            {"symbol": symbol, "datetime": {"$gte": cutoff}},
             {"_id": 0, "symbol": 0},
-            sort=[("datetime", -1)],
-        ).limit(first_size)
+            sort=[("datetime", 1)],   # oldest → latest
+        )
     )
 
     if not docs:
         return pd.DataFrame()
 
-    all_docs       = docs   # newest-first
-    total_fetched  = len(docs)
-    clusters_found = _count_pivot_clusters_from_docs(all_docs)
-
-    # ── Adaptive expansion ────────────────────────────────────────────────────
-    while clusters_found < required_clusters and total_fetched < ADAPTIVE_TOTAL_CAP:
-        remaining = required_clusters - clusters_found
-
-        if clusters_found > 0:
-            candles_per_cluster = total_fetched / clusters_found
-            predicted = int(remaining * candles_per_cluster * ADAPTIVE_FETCH_MULTIPLIER)
-        else:
-            predicted = INITIAL_FETCH_CANDLES * 2
-
-        chunk_size = min(max(predicted, 50), ADAPTIVE_MAX_CHUNK) + EMA_WARMUP_CANDLES
-
-        oldest_dt = all_docs[-1]["datetime"]   # docs are newest-first → last = oldest
-
-        new_docs = list(
-            col.find(
-                {"symbol": symbol, "datetime": {"$lt": oldest_dt}},
-                {"_id": 0, "symbol": 0},
-                sort=[("datetime", -1)],
-            ).limit(chunk_size)
-        )
-
-        if not new_docs:
-            break
-
-        all_docs.extend(new_docs)
-        total_fetched  = len(all_docs)
-        clusters_found = _count_pivot_clusters_from_docs(all_docs)
-
-    if not all_docs:
-        return pd.DataFrame()
-
-    # Convert to chronological order; localize IST naive → IST-aware
-    df = pd.DataFrame(all_docs[::-1])
+    df = pd.DataFrame(docs)
     df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize(IST)
     return df
 
 
-# Patch strategy.load_history with the adaptive IST-naive version
-_strategy.load_history = _adaptive_load_history
+_strategy.load_history = _simple_load_history
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,8 +357,8 @@ def _start_websocket_feed():
 # Scan one symbol
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _scan_symbol(symbol: str, target_date: _date, is_live: bool = False) -> list[dict]:
-    live_candles = live_store.snapshot(symbol) if is_live else []
+def _scan_symbol(symbol: str, target_date: _date) -> list[dict]:
+    live_candles = live_store.snapshot(symbol)      
     df = build_merged_df(symbol, TIMEFRAME, live_candles)
     if df is None:
         return []
@@ -486,15 +401,15 @@ def run_one_day(
     global _latest_signals
 
     mode_tag = "[BACKTEST]" if is_backtest else "[LIVE]"
-    is_live  = not is_backtest
+   
 
     if not is_range:
         print(f"\n  {'=' * 60}")
         print(f"  Target date : {target_date}  {mode_tag}")
         print(f"  Symbols     : {len(symbols)}")
-        print(f"  Data source : MongoDB ({collection_name(TIMEFRAME)}) "
-              f"adaptive fetch (target {MOTHERWAVE_LOOKBACK} waves) + {EMA_WARMUP_CANDLES} EMA warm-up"
-              + (" + WebSocket" if is_live else ""))
+        f"  Data source : MongoDB ({collection_name(TIMEFRAME)}) "
+        f"last {WAVE_LOOKBACK_DAYS} trading days"
+
         print(f"  {'=' * 60}")
 
     t0      = time.time()
@@ -504,7 +419,7 @@ def run_one_day(
     for idx, symbol in enumerate(symbols, 1):
         if _stop_event.is_set():
             break
-        sigs = _scan_symbol(symbol, target_date, is_live=is_live)
+        sigs = _scan_symbol(symbol, target_date)
         if sigs:
             results.extend(sigs)
 
@@ -668,10 +583,18 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.on_event("startup")
 async def startup_event():
-    if RUN_MODE == "LIVE":
-        ws_thread = threading.Thread(target=_start_websocket_feed, daemon=True)
-        ws_thread.start()
-        time.sleep(2)
+    if RUN_MODE in ("LIVE", "SINGLE"):
+        now = datetime.now(IST)
+        market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        is_market_hours = (
+            is_trading_day(now.date())
+            and market_open <= now <= market_close
+        )
+        if is_market_hours:
+            ws_thread = threading.Thread(target=_start_websocket_feed, daemon=True)
+            ws_thread.start()
+            time.sleep(2)
 
     scanner_thread = threading.Thread(target=_scanner_loop, daemon=True)
     scanner_thread.start()

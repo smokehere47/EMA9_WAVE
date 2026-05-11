@@ -87,3 +87,14 @@ def get_last_closed_candle_time(now: datetime) -> datetime:
         )
 
     return last
+
+def get_trading_day_start(n_days: int, from_date: date | None = None) -> datetime:
+    """
+    Returns the IST-naive datetime of market open (09:15) exactly n_days
+    trading days ago, for use as a MongoDB cutoff.
+
+    Returns IST naive (no tzinfo) to match MongoDB storage format.
+    """
+    ref    = from_date if from_date is not None else date.today()
+    cutoff = get_nth_prev_trading_day(ref, n_days)
+    return datetime.combine(cutoff, datetime.min.time().replace(hour=9, minute=15))
